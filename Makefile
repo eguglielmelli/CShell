@@ -1,16 +1,18 @@
 CC = gcc
 CFLAGS = -g -Wall
 
-TARGETS = shell
+TARGET = shell
+SRCS = shell.c input_parser.c
+HEADERS = input_parser.h
 
-.PHONY: clean all 
+.PHONY: clean all
 
-default: shell
+default: $(TARGET)
 
-all: $(TARGETS)
+all: default
 
-shell: shell.c
-	$(CC) $(CFLAGS) $< -o $@
+$(TARGET): $(SRCS) $(HEADERS)
+	$(CC) $(CFLAGS) $(SRCS) -o $(TARGET)
 
 clean:
-	rm -f $(TARGETS) 
+	rm -f $(TARGET)

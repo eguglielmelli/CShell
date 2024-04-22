@@ -9,7 +9,7 @@ default: shell
 
 all: $(TARGETS)
 
-temp_conversion: shell.c
+shell: shell.c
 	$(CC) $(CFLAGS) $< -o $@
 
 clean:

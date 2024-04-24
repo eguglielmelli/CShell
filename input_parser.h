@@ -16,4 +16,6 @@ char* get_token(INPUT_PARSER* parser);
 
 void free_input_parser(INPUT_PARSER* parser);
 
+void free_tokens(char* tokens[],int start_index);
+
 #endif 

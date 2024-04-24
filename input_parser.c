@@ -8,7 +8,7 @@
 /**
  * Removes the front and end whitespace from an input
  * @param input of characters that will be passed from STDIN
- * @return a trimmed pointer
+ * @return a trimmed pointer, NULL if new pointer is empty string
 **/
 char* remove_whitespace(char input[])
 {
@@ -23,6 +23,13 @@ char* remove_whitespace(char input[])
 	        start++;
 	}
 
+	//case where the input is empty after removing whitespace
+	if(input[start] == '\0')
+	{
+		return NULL;
+	}
+
+
 	//trim whitespace on the back end
 	while(end > start && isspace((unsigned char) input[end]))
 	{
@@ -32,7 +39,7 @@ char* remove_whitespace(char input[])
 	int trimmed_len = end - start + 1;
 
 
-	//set up our pointer to be return 
+	//set up our pointer to be returned
 
     char* new_input = malloc(trimmed_len+1);
 
@@ -83,8 +90,6 @@ INPUT_PARSER* init_input_parser(char* input)
 	memcpy(input_parser->str,input,length);
 
 	input_parser->position = input_parser->str;
-
-	printf("%s\n","Parser Initialized!");
 
 	return input_parser;
 }
@@ -162,6 +167,10 @@ char* get_token(INPUT_PARSER* parser)
 
 }
 
+/**
+ * Deallocate the input parser
+ * @param input parser 
+ **/
 void free_input_parser(INPUT_PARSER* parser)
 {
 	if(parser == NULL)
@@ -174,4 +183,19 @@ void free_input_parser(INPUT_PARSER* parser)
 	free(parser);
 
 	return;
+}
+
+/**
+ * Function deallocates any remaining tokens after we have processed 
+ * the commands
+ * @param tokens array
+ * @param start index, which will represent the length of the
+ * array after all tokens have been processed 
+**/ 
+void free_tokens(char* tokens[],int start_index)
+{
+	for(int i = 0; i < start_index; i++)
+	{
+		free(tokens[i]);
+	}
 }

@@ -189,13 +189,12 @@ void free_input_parser(INPUT_PARSER* parser)
  * Function deallocates any remaining tokens after we have processed 
  * the commands
  * @param tokens array
- * @param start index, which will represent the length of the
- * array after all tokens have been processed 
 **/ 
-void free_tokens(char* tokens[],int start_index)
+void free_tokens(char** tokens)
 {
-	for(int i = 0; i < start_index; i++)
+	for(int i = 0; tokens[i] != NULL; i++)
 	{
 		free(tokens[i]);
+		tokens[i] = NULL;
 	}
 }

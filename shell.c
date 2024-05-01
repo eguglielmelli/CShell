@@ -17,9 +17,9 @@ void kill_child_process();
 void sig_int_handler(int handler);
 void change_output(char* file_name);
 void change_input(char* file_name);
-void execute_command(char** command, char** files);
-char** prepare_command_array(char** tokens, int start_index);
-char** check_for_files(char** array, int start_index);
+int execute_command(char** command, char** files);
+char** prepare_command_array(char** tokens, int array_length);
+char** check_for_files(char** array, int array_length);
 
 void implement_pipeline(char** first_command,char** second_command);
 
@@ -113,6 +113,7 @@ void run_shell()
 	//hard code for exit out of shell, also ctrl + d works
 	if(strcmp(command,"exit") == 0)
 	{
+		free(command);
 		exit(EXIT_SUCCESS);
 	}
 
@@ -149,8 +150,18 @@ void run_shell()
 	
 	if(pipe_index != -1)
 	{
+		//first free our pipe_index
+		//then set to null
+		free(tokens[pipe_index]);
 		tokens[pipe_index] = NULL;
+
+		//implement pipeline
 		implement_pipeline(tokens,&tokens[pipe_index+1]);
+
+		//free our dynamically allocated variables before returning
+		free_tokens(tokens);
+		free_tokens(&tokens[pipe_index+1]);
+		free_input_parser(input_parser);
 		return;
 
 	}
@@ -160,10 +171,24 @@ void run_shell()
 	//this cleans our array, handling redirection if necessary
 	char** final_command_array = prepare_command_array(tokens,start_index);
 
-	//actual execution of the command
-	execute_command(final_command_array,potential_files);
+	
+	//these next two lines may be a bit redundant
+	//however, I think using exit() under an error was more
+	//important so it was better to have a bit of 
+	//duplicate code 
+	if(execute_command(final_command_array,potential_files) == -1)
+	{
+		free_tokens(tokens);
+		free(potential_files);
+		free(final_command_array);
+		free_input_parser(input_parser);
+		exit(EXIT_FAILURE);
+	}
 
-	free_tokens(tokens,start_index);
+	//free any dynamically allocated memory
+	free(potential_files);
+	free(final_command_array);
+	free_tokens(tokens);
 	free_input_parser(input_parser);
 	return;
 }
@@ -206,7 +231,11 @@ void kill_child_process()
 	}
 }
 
-
+/**
+ * Function represents a two stage pipeline
+ * @param first command (first half before the pipe symbol)
+ * @param second command (second half after the pipe symbol)
+**/
 void implement_pipeline(char** first_command, char** second_command)
 {
 	int fd[2];
@@ -217,20 +246,32 @@ void implement_pipeline(char** first_command, char** second_command)
 	if(first_command == NULL || second_command == NULL)
 	{
 		perror("Pipe commands cannot be null");
+		free(first_command);
+		free(second_command);
 		return;
 	}
 
+
+	//important: if pipe system call fails we should exit
 	if(pipe(fd) == -1)
 	{
 		perror("Pipe error");
+		free(first_command);
+		free(second_command);
+		free_input_parser(input_parser);
 		exit(EXIT_FAILURE);
 	}
 
+	//code block represents our first child process running 
+	//call fork and immediately exit if call fails
 	child_pid_1 = fork();
 
 	if(child_pid_1 == -1)
 	{
 		perror("Fork error");
+		free(first_command);
+		free(second_command);
+		free_input_parser(input_parser);
 		exit(EXIT_FAILURE);
 	}
 
@@ -238,14 +279,24 @@ void implement_pipeline(char** first_command, char** second_command)
 	{
 		close(fd[0]);
 
+		//array maintenance:
+		//want to check for files if necessary
+		//also get the length to pass into the functions
 		int first_command_len = array_length(first_command);
+
 		char** files = check_for_files(first_command,first_command_len);
 
 		char** cleaned_array = prepare_command_array(first_command,first_command_len);
 
+		//change file descriptor and assign fils if necessary
 		if(dup2(fd[1],STDOUT_FILENO) == -1)
 		{
 			perror("Cannot change pipe output");
+			free(first_command);
+			free(second_command);
+			free(files);
+			free(cleaned_array);
+			free_input_parser(input_parser);
 			exit(EXIT_FAILURE);
 		}
 
@@ -259,8 +310,15 @@ void implement_pipeline(char** first_command, char** second_command)
 			change_input(files[1]);
 		}
 
+		//finally execute the command and close file descriptor
+		//free dynamically allocated variables
 		if(execvp(cleaned_array[0],cleaned_array) == -1)
 		{
+			free(cleaned_array);
+			free(first_command);
+			free(second_command);
+			free(files);
+			free_input_parser(input_parser);
 			perror("Cannot process command");
 			exit(EXIT_FAILURE);
 		}
@@ -269,11 +327,17 @@ void implement_pipeline(char** first_command, char** second_command)
 
 	}
 
+
+	//process is exactly the same as above except 
+	// the different file descriptor
 	child_pid_2 = fork();
 
 	if(child_pid_2 == -1)
 	{
 		perror("Fork error");
+		free(first_command);
+		free(second_command);
+		free_input_parser(input_parser);
 		exit(EXIT_FAILURE);
 	}
 
@@ -287,9 +351,15 @@ void implement_pipeline(char** first_command, char** second_command)
 
 		char** cleaned_array = prepare_command_array(second_command,second_command_len);
 
+
 		if(dup2(fd[0],STDIN_FILENO) == -1)
 		{
 			perror("Cannot change pipe input");
+			free(first_command);
+			free(second_command);
+			free(files);
+			free(cleaned_array);
+			free_input_parser(input_parser);
 			exit(EXIT_FAILURE);
 		}
 
@@ -306,13 +376,18 @@ void implement_pipeline(char** first_command, char** second_command)
 		if(execvp(cleaned_array[0],cleaned_array) == -1)
 		{
 			perror("Cannot process command");
+			free(first_command);
+			free(second_command);
+			free(files);
+			free(cleaned_array);
+			free_input_parser(input_parser);
 			exit(EXIT_FAILURE);
 		}
 
-		// execute_command(cleaned_array,files);
 		close(fd[0]);
 	}
 	
+	//close file descriptors and wait so no zombies
 	close(fd[0]);
 	close(fd[1]);
 	waitpid(child_pid_1,NULL,0);
@@ -321,6 +396,7 @@ void implement_pipeline(char** first_command, char** second_command)
 	child_pid_1 = 0;
 
 	child_pid_2 = 0;
+
 
 	return;
 
@@ -387,11 +463,11 @@ void change_output(char* file_name)
  * Function cleans an array that has redirection
  * by skipping over the redirection symbol(s)
  * @param tokens, this is the command with redirection
- * @param start_index, this is the length of tokens
+ * @param array_length, this is the length of tokens
  * @return an array that will be sent to execute_command()
  * without redirection symbol(s)
 **/ 
-char** prepare_command_array(char* tokens[],int start_index)
+char** prepare_command_array(char* tokens[],int array_length)
 {
 	//handle null input
 	if(tokens == NULL)
@@ -403,7 +479,7 @@ char** prepare_command_array(char* tokens[],int start_index)
 	//code block will dynamically allocate the array, check for errors
 	//then fill the array while skipping over redirection
 	//and finally null terminate and return
-	char** cleaned_array = malloc(sizeof(char*) * (start_index+1));
+	char** cleaned_array = malloc(sizeof(char*) * (array_length+1));
 
 	if(cleaned_array == NULL)
 	{
@@ -413,7 +489,7 @@ char** prepare_command_array(char* tokens[],int start_index)
 
 	int arg_index = 0;
 
-	for(int i = 0; i < start_index;i++)
+	for(int i = 0; i < array_length;i++)
 	{
 		if(strcmp(tokens[i],"<") == 0 || strcmp(tokens[i],">") == 0)
 		{
@@ -431,8 +507,6 @@ char** prepare_command_array(char* tokens[],int start_index)
 }
 
 
-//TODO: Consider making this more streamlined since pipe method is kind of redundant
-
 /**
  * Function will execute the command after calling fork() and execvp()
  * @param array, the command array that will be passed to execvp()
@@ -441,14 +515,14 @@ char** prepare_command_array(char* tokens[],int start_index)
  * @param input_file_name name of input file (could also be null if no 
  * redirection)
 **/ 
-void execute_command(char** array,char** files)
+int execute_command(char** array,char** files)
 {
 
 	//null check, immediately after call fork()
 	if(array == NULL)
 	{
 		printf("%s\n","command array must not be null");
-		return;
+		return -1;
 	}
 
 	child_pid = fork();
@@ -457,7 +531,7 @@ void execute_command(char** array,char** files)
 	if(child_pid == -1)
 	{
 		perror("Fork failure");
-		exit(EXIT_FAILURE);
+		return -1;
 	}
 
 	//assuming no fork error, we should check if the file names are not null
@@ -474,10 +548,12 @@ void execute_command(char** array,char** files)
 			change_input(files[1]);
 		}
 
+		//free our dynamically allocated variables
+		//in case of execvp failure
 		if(execvp(array[0],array) == -1)
 		{
 			perror("Could not execute command");
-			exit(EXIT_FAILURE);
+			return -1;
 		}
 	}
 
@@ -485,13 +561,21 @@ void execute_command(char** array,char** files)
 	waitpid(child_pid,NULL,0);
 	child_pid = 0;
 
-	return;
+	return 0;
 
 }
 
-char** check_for_files(char** array,int start_index)
+/**
+ * Function will check if redirection files exist and return them if necessary
+ * @param array, this is the command array, return NULL if null
+ * @param array_length length of the input array
+ * @return an array of size two with files if necessary 
+ * or else both are NULL
+**/ 
+char** check_for_files(char** array,int array_length)
 {
 
+	//file placeholders
 	char* input_file_name = NULL;
 	char* output_file_name = NULL;
 
@@ -501,20 +585,23 @@ char** check_for_files(char** array,int start_index)
 		return NULL;
 	}
 
-
-	for(int i = 0; i < start_index;i++)
+	//go through the array, checking for redirection symbols so
+	//we know to assign files
+	for(int i = 0; i < array_length;i++)
 	{
-		if((strcmp(array[i],"<") == 0) && i+1 < start_index)
+		if((strcmp(array[i],"<") == 0) && i+1 < array_length)
 		{
 			input_file_name = array[i+1];
 		}
 
-		if((strcmp(array[i],">") == 0) && i+1 < start_index)
+		if((strcmp(array[i],">") == 0) && i+1 < array_length)
 		{
 			output_file_name = array[i+1];
 		}
 	}
 
+	//dynamically allocate and assign the files
+	//possible that they are both null if no files
 	char** files = malloc(sizeof(char*) * 2);
 
 	files[0] = output_file_name;
@@ -523,14 +610,23 @@ char** check_for_files(char** array,int start_index)
 	return files;
 }
 
+/**
+ * function to get the length of an array, handy for when
+ * executing the pipe line since we are passing in two command arrays 
+ * and not necessarily their length
+ * @param command array
+ * @return length of array if array is not NULL, otherwise -1
+**/ 
 int array_length(char** array)
 {
+	//NULL check
 	if(array == NULL)
 	{
 		perror("Cannot find length of NULL array");
 		return -1;
 	}
 
+	//iterate and return our array length
 	int length = 0;
 
 	while(array[length] != NULL)

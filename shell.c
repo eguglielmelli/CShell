@@ -5,29 +5,21 @@
 #include <signal.h>
 #include <sys/types.h>
 #include <sys/wait.h>
-#include "input_parser.h"
 #include <fcntl.h>
 #include <string.h>
+#include "input_parser.h"
+#include "shell.h"
+#include "utils.h"
 
 #define MAX_LINE 4096
-
-void run_shell();
-void register_signal_handler();
-void kill_child_process();
-void sig_int_handler(int handler);
-void change_output(char* file_name);
-void change_input(char* file_name);
-int execute_command(char** command, char** files);
-char** prepare_command_array(char** tokens, int array_length);
-char** check_for_files(char** array, int array_length);
-
-void implement_pipeline(char** first_command,char** second_command);
-
-int array_length(char** array);
 
 INPUT_PARSER* input_parser;
 
 pid_t child_pid;
+
+bg_proc_manager_t bg_proc_manager;
+process_t* bg_processes[MAX_BG_PROC];
+command_history_t command_history;
 
 /**
  * Function gets the command from the user and 
@@ -39,8 +31,7 @@ char* get_command()
 {
 	char* buf = malloc(MAX_LINE);
 
-	//exit if malloc() error since we need commmand from user to proceed
-	if(buf == NULL)
+	if(!buf)
 	{
 		perror("Could not allocate memory for buffer");
 		exit(EXIT_FAILURE);
@@ -48,22 +39,19 @@ char* get_command()
 
 	int bytes_read = read(STDIN_FILENO,buf,MAX_LINE-1);
 
-	//read error handling
 	if(bytes_read < 0)
 	{
 		perror("Error reading from standard in");
 		return NULL;
 	}
 
-	//remember to free buffer here if user
-	//enters control + d
 	if(bytes_read == 0)
 	{
 		free(buf);
+		free_history(&command_history);
 		exit(EXIT_SUCCESS);
 	}
 
-	//null terminate, remove front/end whitespace, and free allocated buffer
 	buf[bytes_read] = '\0';
 
 	char* cleaned_command = remove_whitespace(buf);
@@ -76,6 +64,9 @@ char* get_command()
 int main()
 {
 	register_signal_handler();
+	register_sig_chld_handler();
+	init_bg_proc_manager(&bg_proc_manager);
+	init_command_hist_arr(&command_history);
 	while(1)
 	{
 		run_shell();
@@ -90,34 +81,26 @@ int main()
 **/
 void run_shell()
 {
-	//will hold our tokens, providing token space to user
 	char* tokens[1000];
 
 	int pipe_index = -1; 
-
-
-	//continuous arrow printing to the console using write()
-	char* arrow = "enter command here: > ";
-
-	if(write(STDOUT_FILENO,arrow,strlen(arrow)) == -1)
-	{
-		perror("Error writing to std out");
-		exit(EXIT_FAILURE);
-	}
-
+	
+	//placeholder for background so we know whether to call wait() or not
+	int background = 0;
+	
+	print_prompt();	
+	
 	char* command = get_command();
 
 
-	if(command == NULL) return;
+	if(!command) return;
 
-	//hard code for exit out of shell, also ctrl + d works
-	if(strcmp(command,"exit") == 0)
+	add_to_history(&command_history,command);
+
+	if(check_basic_commands(&command) == 0)
 	{
-		free(command);
-		exit(EXIT_SUCCESS);
+		return;
 	}
-
-
 	input_parser = init_input_parser(command);
 
 	free(command);
@@ -126,39 +109,67 @@ void run_shell()
 
 	char* token = get_token(input_parser);
 
-	//grab our tokens, store them in array initialized above
 	while(token != NULL)
 	{
 		tokens[start_index] = token;
 		start_index++;
 		token = get_token(input_parser);
 	}
+		
+	if(strcmp(tokens[0],"fg") == 0)
+	{
+		tokens[start_index] = NULL;	
+		bring_to_fg(tokens, &bg_proc_manager);
+		free_tokens(tokens);
+		free_input_parser(input_parser);
+		return;
+	}
 
-	//null terminate tokens, very important for execvp() call
-	tokens[start_index] = NULL;
 
+	if(strcmp(tokens[start_index-1], "&") == 0)
+	{
+		background = 1;
+	}
+	
+	//important: remove the background symbol and decrease start_index
+	//so we don't segfault
+	if(background)
+	{
+		free(tokens[start_index-1]);
+		tokens[start_index-1] = NULL;
+		start_index--;
+		
+	}
+	else
+	{
+		//null terminate tokens, very important for execvp() call
+		tokens[start_index] = NULL;
+	}
 
-	//go through our tokens array, check for redirection
-	//so we know to change input/output in execute_command()
 	for(int i = 0; i < start_index;i++)
 	{
 		if(strcmp("|",tokens[i]) == 0)
 		{
+			if(i-1 >= 0 && strcmp("&",tokens[i-1]) == 0)
+			{
+				fprintf(stderr,"parse error near |: & \n");
+				free_tokens(tokens);
+				free_input_parser(input_parser);
+				return;
+			}
 			pipe_index = i;
 		}
+
 	}
 	
+	//pipe symbol is present, handle accordingly 
 	if(pipe_index != -1)
 	{
-		//first free our pipe_index
-		//then set to null
 		free(tokens[pipe_index]);
 		tokens[pipe_index] = NULL;
 
-		//implement pipeline
-		implement_pipeline(tokens,&tokens[pipe_index+1]);
+		implement_pipeline(tokens,&tokens[pipe_index+1], background);
 
-		//free our dynamically allocated variables before returning
 		free_tokens(tokens);
 		free_tokens(&tokens[pipe_index+1]);
 		free_input_parser(input_parser);
@@ -168,7 +179,6 @@ void run_shell()
 
 	char** potential_files = check_for_files(tokens,start_index);
 
-	//this cleans our array, handling redirection if necessary
 	char** final_command_array = prepare_command_array(tokens,start_index);
 
 	
@@ -176,16 +186,16 @@ void run_shell()
 	//however, I think using exit() under an error was more
 	//important so it was better to have a bit of 
 	//duplicate code 
-	if(execute_command(final_command_array,potential_files) == -1)
+	if(execute_command(final_command_array,potential_files,background) == -1)
 	{
 		free_tokens(tokens);
 		free(potential_files);
 		free(final_command_array);
 		free_input_parser(input_parser);
+		free_history(&command_history);
 		exit(EXIT_FAILURE);
 	}
 
-	//free any dynamically allocated memory
 	free(potential_files);
 	free(final_command_array);
 	free_tokens(tokens);
@@ -214,7 +224,39 @@ void sig_int_handler(int handler)
 {
 	if(child_pid != 0)
 	{
-		kill_child_process();
+		kill(child_pid, SIGINT);
+	}
+}
+
+/**
+ * Function for reclaiming the zombies in the
+ * background so they are removed from 
+ * the process table
+**/
+void sig_chld_handler(int sig)
+{
+	int status;
+	int pid;
+	while((pid = waitpid(-1, &status,WNOHANG))> 0)
+	{
+		char buffer[100];
+		snprintf(buffer, sizeof(buffer), "\npid %d done\n", pid);
+		write(STDOUT_FILENO, buffer, strlen(buffer));		
+		free_bg_proc(pid, &bg_proc_manager);
+		print_prompt();
+	}
+}
+
+/**
+ * function used for the background child processes
+ * exits if signal() fails
+**/
+void register_sig_chld_handler()
+{
+	if(signal(SIGCHLD,sig_chld_handler) == SIG_ERR)
+	{
+		perror("Could not register child handler signal");
+		exit(EXIT_FAILURE);
 	}
 }
 
@@ -224,7 +266,7 @@ void sig_int_handler(int handler)
 **/ 
 void kill_child_process()
 {
-	if(kill(child_pid,SIGKILL) == -1)
+	if(kill(child_pid, SIGKILL) == -1) 
 	{
 		perror("Error killing child process");
 		exit(EXIT_FAILURE);
@@ -236,14 +278,14 @@ void kill_child_process()
  * @param first command (first half before the pipe symbol)
  * @param second command (second half after the pipe symbol)
 **/
-void implement_pipeline(char** first_command, char** second_command)
+void implement_pipeline(char** first_command, char** second_command, int background)
 {
 	int fd[2];
 	pid_t child_pid_1;
 	pid_t child_pid_2;
 
 
-	if(first_command == NULL || second_command == NULL)
+	if(!first_command || !second_command)
 	{
 		perror("Pipe commands cannot be null");
 		free(first_command);
@@ -252,7 +294,6 @@ void implement_pipeline(char** first_command, char** second_command)
 	}
 
 
-	//important: if pipe system call fails we should exit
 	if(pipe(fd) == -1)
 	{
 		perror("Pipe error");
@@ -279,16 +320,12 @@ void implement_pipeline(char** first_command, char** second_command)
 	{
 		close(fd[0]);
 
-		//array maintenance:
-		//want to check for files if necessary
-		//also get the length to pass into the functions
 		int first_command_len = array_length(first_command);
 
 		char** files = check_for_files(first_command,first_command_len);
 
 		char** cleaned_array = prepare_command_array(first_command,first_command_len);
 
-		//change file descriptor and assign fils if necessary
 		if(dup2(fd[1],STDOUT_FILENO) == -1)
 		{
 			perror("Cannot change pipe output");
@@ -310,8 +347,6 @@ void implement_pipeline(char** first_command, char** second_command)
 			change_input(files[1]);
 		}
 
-		//finally execute the command and close file descriptor
-		//free dynamically allocated variables
 		if(execvp(cleaned_array[0],cleaned_array) == -1)
 		{
 			free(cleaned_array);
@@ -387,20 +422,24 @@ void implement_pipeline(char** first_command, char** second_command)
 		close(fd[0]);
 	}
 	
-	//close file descriptors and wait so no zombies
 	close(fd[0]);
 	close(fd[1]);
-	waitpid(child_pid_1,NULL,0);
-	waitpid(child_pid_2,NULL,0);
+
+	if(!background)
+	{
+		waitpid(child_pid_1,NULL,0);
+		waitpid(child_pid_2,NULL,0);
+	}
+	else
+	{
+		init_bg_process(child_pid_1,&command_history);
+		init_bg_process(child_pid_2,&command_history);
+	}
 
 	child_pid_1 = 0;
-
 	child_pid_2 = 0;
 
-
 	return;
-
-
 }
 
 /**
@@ -410,8 +449,6 @@ void implement_pipeline(char** first_command, char** second_command)
 **/ 
 void change_input(char* file_name)
 {
-	//open file as read only since this will be our input
-	//handle errors if necessary
 	int fd = open(file_name,O_RDONLY);
 
 	if(fd < 0)
@@ -427,7 +464,6 @@ void change_input(char* file_name)
 		exit(EXIT_FAILURE);
 	}
 
-	//remember to close if dup2() was successful
 	close(fd);
 }
 
@@ -438,8 +474,6 @@ void change_input(char* file_name)
 **/ 
 void change_output(char* file_name)
 {
-	//open for writing if exists, if not create
-	//also truncate
 	int fd = open(file_name,O_WRONLY | O_CREAT | O_TRUNC,0644);
 
 	if(fd < 0)
@@ -455,7 +489,6 @@ void change_output(char* file_name)
 		exit(EXIT_FAILURE);
 	}
 
-	//remember close fd if dup2() was successful
 	close(fd);
 }
 
@@ -469,16 +502,12 @@ void change_output(char* file_name)
 **/ 
 char** prepare_command_array(char* tokens[],int array_length)
 {
-	//handle null input
 	if(tokens == NULL)
 	{
 		printf("%s\n","Cannot clean redirection array: input NULL");
 		return NULL;
 	}
 
-	//code block will dynamically allocate the array, check for errors
-	//then fill the array while skipping over redirection
-	//and finally null terminate and return
 	char** cleaned_array = malloc(sizeof(char*) * (array_length+1));
 
 	if(cleaned_array == NULL)
@@ -515,10 +544,9 @@ char** prepare_command_array(char* tokens[],int array_length)
  * @param input_file_name name of input file (could also be null if no 
  * redirection)
 **/ 
-int execute_command(char** array,char** files)
+int execute_command(char** array,char** files, int background)
 {
 
-	//null check, immediately after call fork()
 	if(array == NULL)
 	{
 		printf("%s\n","command array must not be null");
@@ -534,10 +562,16 @@ int execute_command(char** array,char** files)
 		return -1;
 	}
 
-	//assuming no fork error, we should check if the file names are not null
-	//so we can change input/output as necessary
 	if(child_pid == 0)
 	{
+
+		//we want to make sure control + c doesn't 
+		//end a bg process
+		if(background)
+		{
+			signal(SIGINT,SIG_IGN);
+		}
+
 		if(files[0] != NULL)
 		{
 			change_output(files[0]);
@@ -547,20 +581,24 @@ int execute_command(char** array,char** files)
 		{
 			change_input(files[1]);
 		}
-
-		//free our dynamically allocated variables
-		//in case of execvp failure
+		
 		if(execvp(array[0],array) == -1)
 		{
 			perror("Could not execute command");
 			return -1;
 		}
 	}
-
-	//wait so there are no zombies
-	waitpid(child_pid,NULL,0);
-	child_pid = 0;
-
+	
+	if(!background)
+	{
+		waitpid(child_pid,NULL,0);
+		child_pid = 0;
+		return 0;
+	}
+	else 
+	{
+		init_bg_process(child_pid,&command_history);
+	}
 	return 0;
 
 }
@@ -574,8 +612,6 @@ int execute_command(char** array,char** files)
 **/ 
 char** check_for_files(char** array,int array_length)
 {
-
-	//file placeholders
 	char* input_file_name = NULL;
 	char* output_file_name = NULL;
 
@@ -585,8 +621,6 @@ char** check_for_files(char** array,int array_length)
 		return NULL;
 	}
 
-	//go through the array, checking for redirection symbols so
-	//we know to assign files
 	for(int i = 0; i < array_length;i++)
 	{
 		if((strcmp(array[i],"<") == 0) && i+1 < array_length)
@@ -611,28 +645,316 @@ char** check_for_files(char** array,int array_length)
 }
 
 /**
- * function to get the length of an array, handy for when
- * executing the pipe line since we are passing in two command arrays 
- * and not necessarily their length
- * @param command array
- * @return length of array if array is not NULL, otherwise -1
-**/ 
-int array_length(char** array)
+ * Function just writes the prompt
+ * out to stdout, makes code more modular
+ * since we are calling it in a couple 
+ * spots
+ **/
+void print_prompt()
 {
-	//NULL check
-	if(array == NULL)
+	char* arrow = "enter command here: > ";
+
+	if(write(STDOUT_FILENO,arrow,strlen(arrow)) == -1)
 	{
-		perror("Cannot find length of NULL array");
-		return -1;
+		perror("Error writing to std out");
+		exit(EXIT_FAILURE);
+	}
+}
+
+/**
+ * Function will initialize a bg process 
+ * and place it into our bg processes array
+ * by finding the first available non-null index
+**/
+void init_bg_process(pid_t process_id,command_history_t* command_history)
+{
+	if(process_id == -1 || command_history == NULL)
+	{
+		fprintf(stderr,"process id must not be -1 and command history must not be null");
+		return; 
 	}
 
-	//iterate and return our array length
-	int length = 0;
+	process_t* bg_process = malloc(sizeof(process_t));
 
-	while(array[length] != NULL)
+	if(!bg_process)
 	{
-		length++;
+		perror("Malloc failure trying to init bg process");
+		exit(EXIT_FAILURE);
+	}
+    bg_process->command = command_history->commands[command_history->last_used_index-1];
+	bg_process->pid = process_id;
+
+
+	for(int i = 0; i < MAX_BG_PROC; i++)
+	{
+		if(bg_proc_manager.bg_processes[i] == NULL)
+		{
+			bg_proc_manager.bg_processes[i] = bg_process;
+			bg_process->index = i;
+			bg_proc_manager.size++;
+			break;
+		}
+	}
+	printf("[%d] %d %s\n", bg_process->index+1,bg_process->pid, bg_process->command);	
+	return;
+}
+
+/**
+ * Function frees the bg process
+ * by finding the job with that pid
+ * this also allows us to simply assign 
+ * the next bg job to the first available space
+ **/ 
+void free_bg_proc(pid_t pid, bg_proc_manager_t* bg_proc_manager)
+{
+	if(!bg_proc_manager)
+	{
+		fprintf(stderr, "cannot free bg process if bg process manager is null");
+		return;
+	}
+	for(int i = 0; i < MAX_BG_PROC; i++)
+	{
+		if(bg_proc_manager->bg_processes[i] != NULL && bg_proc_manager->bg_processes[i]->pid == pid)
+		{
+			free(bg_proc_manager->bg_processes[i]);
+			bg_proc_manager->bg_processes[i] = NULL;
+			bg_proc_manager->size--;
+			break;
+		}
+	}
+}
+
+/**
+ * Function mimics the Unix "fg" command
+ * this command can have an index number passed in or
+ * not, if it doesn't have an index
+ * we pull the last started bg process
+ * to the fg
+ **/
+void bring_to_fg(char** tokens, bg_proc_manager_t* bg_proc_manager)
+{
+	if(!(*tokens))
+	{
+		fprintf(stderr, "Cannot move process to foreground, tokens is NULL");
+		return;
 	}
 
-	return length;
+	int tokens_length = array_length(tokens);
+
+	// handle the case where no index is passed in
+	if(tokens_length == 1)
+	{
+		int index = -1;
+
+		for(int i = 0; i < MAX_BG_PROC; i++)
+		{
+			if(bg_proc_manager->bg_processes[i] != NULL)
+			{
+					index = i;
+			}
+		}
+
+		if(index != -1)
+		{
+			waitpid(bg_proc_manager->bg_processes[index]->pid,NULL,0);
+			free_bg_proc(bg_proc_manager->bg_processes[index]->pid, bg_proc_manager);
+			bg_proc_manager->size--;
+		}
+		else
+		{
+			printf("%s\n", "No bg processes currently running");
+			return;
+		}
+			
+	}
+	else
+	{
+		if(tokens_length > 2)
+		{
+			printf("%s\n", "Please provide a single valid bg process index");
+			return;
+		}
+
+		//atoi returning 0 either means the input
+		//was not valid
+		//or it means that the index
+		//passed in was 0 which is still invalid
+		int bg_index = atoi(tokens[1]);
+		if(bg_index-1 < 0 || bg_index-1 >= MAX_BG_PROC)
+		{
+			printf("%s\n", "no such job");
+			return;
+		}
+		
+		if(bg_proc_manager->bg_processes[bg_index-1] != NULL)
+		{
+			waitpid(bg_proc_manager->bg_processes[bg_index-1]->pid,NULL,0);
+			free_bg_proc(bg_proc_manager->bg_processes[bg_index-1]->pid, bg_proc_manager);
+			bg_proc_manager->size--;
+		}
+		else
+		{
+			printf("%s\n", "no such job");
+			return;
+		}
+	}
+}
+
+/**
+ * Function is a semi-copy of the unix "jobs"
+ * command
+**/
+void print_jobs(bg_proc_manager_t* bg_proc_manager)
+{
+	if(bg_proc_manager->size == 0)
+	{
+		printf("%s\n", "no jobs running in background");
+		return;
+	}
+
+	printf("%s\n","No.\tStatus\tCommand");
+	for(int i = 0; i < MAX_BG_PROC; i++)
+	{
+		if(bg_proc_manager->bg_processes[i] != NULL)
+		{
+			printf("[%d]\tRunning\t%s\n",i+1, bg_proc_manager->bg_processes[i]->command);
+		}
+	}
+	fflush(stdout);
+}
+
+/**
+ * Function initializes the bg process manager which
+ * will hold the array and keep track of number 
+ * of current bg processes
+**/
+void init_bg_proc_manager(bg_proc_manager_t* process_manager)
+{
+	if(process_manager == NULL)
+	{
+		fprintf(stderr, "background process manager cannot be NULL");
+		return;
+	}
+	for(int i = 0; i < MAX_BG_PROC; i++)
+	{
+		process_manager->bg_processes[i] = NULL;
+	}
+	process_manager->size = 0;
+}
+
+void init_command_hist_arr(command_history_t* command_history)
+{
+	for(int i = 0; i < MAX_COM_HIST; i++)
+	{
+		command_history->commands[i] = NULL;
+	}
+	command_history->size = 0;
+	command_history->last_used_index = 0;
+}
+
+/**
+ * Allows the user to see their command history
+**/
+void print_history(command_history_t *command_history)
+{
+	if(!command_history)
+	{
+		fprintf(stderr,"cannot print command history if command_history struct is NULL\n");
+		return;
+	}
+	for(int i = 0; i < command_history->size; i++)
+	{
+		printf("%d %s\n", i+1, command_history->commands[i]);
+		fflush(stdout);
+	}
+}
+
+/**
+ * This function will add to our global command
+ * history variable so that users can see their
+ * command history
+ * if the user is at the max history, it evicts
+ * the last history entry
+**/
+void add_to_history(command_history_t *command_history, char *command)
+{
+	if(!command_history || !command)
+	{
+		fprintf(stderr, "command_history and command cannot be NULL");
+		return;
+	}
+
+	char* hist_command = strdup(command);
+	if(command_history->size == MAX_COM_HIST)
+	{
+		free(command_history->commands[command_history->last_used_index]);
+		command_history->commands[command_history->last_used_index] = NULL;
+		command_history->commands[command_history->last_used_index] = hist_command;
+		return;
+	}	
+		command_history->commands[command_history->last_used_index] = hist_command;
+		if(command_history->last_used_index < MAX_COM_HIST-1)
+		{
+			command_history->last_used_index++;
+		}
+		command_history->size++;
+		return;
+}
+
+/**
+ * cleans up the command_history global variable
+**/
+void free_history(command_history_t *command_history)
+{
+	if(!command_history)
+	{
+		fprintf(stderr, "Cannot free command history if it is NULL");
+		return;
+	}
+
+	for(int i = 0; i < command_history->size;i++)
+	{
+		if(command_history->commands[i] != NULL)
+		{
+			free(command_history->commands[i]);
+			command_history->commands[i] = NULL;
+		}
+	}
+}
+
+/**
+ * this function serves as a way to clean up the run_shell()
+ * function, this is where I will add commands that don't
+ * necessarily need tokenizing
+**/
+int check_basic_commands(char** command)
+{
+	if(!(*command))
+	{
+		fprintf(stderr, "Cannot interpret NULL command");
+		return 1;
+	}
+
+	if(strcmp(*command,"exit") == 0)
+	{
+		free(*command);
+		free_history(&command_history);
+		exit(EXIT_SUCCESS);
+	}
+
+	else if(strcmp(*command,"jobs") == 0)
+	{
+		print_jobs(&bg_proc_manager);
+		free(*command);
+		return 0;
+	}
+
+	else if(strcmp(*command, "history") == 0)
+	{
+		print_history(&command_history);
+		free(*command);
+		return 0;
+	}
+
+	return 1;
 }
